@@ -38,7 +38,7 @@ jobs:
       - name: Verify version matches tag
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
-          PKG_VERSION=$(python -c "import re; print(re.search(r'__version__\s*=\s*[\"\'']([^\"\'']+)[\"\'']', open('magma/__init__.py').read()).group(1))")
+          PKG_VERSION=$(python -c "import re; print(re.search(r'__version__ = \"(.*?)\"', open('magma/__init__.py').read()).group(1))")
           if [ "$TAG" != "$PKG_VERSION" ]; then
             echo "ERROR: Tag v$TAG does not match package version $PKG_VERSION"
             exit 1
