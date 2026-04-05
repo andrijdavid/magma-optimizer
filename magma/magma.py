@@ -6,12 +6,21 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+# Keys used by common optimizers for their first-moment (momentum) buffer.
+_MOMENT_KEYS = ("exp_avg", "momentum_buffer")
+
 
 class Magma:
     """
-    A Pytorch optimizer wraper with block-wise stochastic masking
+    A Pytorch optimizer wrapper with block-wise stochastic masking
     modulated by momentum-gradient alignment.
     As explained here https://arxiv.org/abs/2602.15322
+
+    By default (``moment_key="auto"``), Magma reads the first-moment
+    estimate directly from the base optimizer's state (e.g. Adam's
+    ``exp_avg``), matching the paper and adding no extra memory. When
+    the base optimizer lacks a first-moment buffer (e.g. vanilla SGD),
+    Magma falls back to its own EMA controlled by ``momentum_beta``.
     """
 
     def __init__(
@@ -21,6 +30,7 @@ class Magma:
         tau: float = 2.0,
         momentum_beta: float = 0.9,
         alignment_ema: float = 0.9,
+        moment_key: str | None = "auto",
         exclude: set[Tensor] | None = None,
     ) -> None:
         if not 0.0 <= mask_prob <= 1.0:
@@ -33,86 +43,99 @@ class Magma:
         self.tau = tau
         self.momentum_beta = momentum_beta
         self.alignment_ema = alignment_ema
+        self.moment_key = moment_key
         self._exclude_ids: set[int] = {id(t) for t in (exclude or ())}
 
-        # Magma-specific per-parameter state keyed by param id for momentum and alignment
+        # Per-parameter state: always contains alignment EMA;
+        # contains momentum only when the base optimizer has no first-moment.
         self._state: dict[int, dict[str, Tensor]] = {}
 
+    # ------------------------------------------------------------------
+    def _get_first_moment(self, p: Tensor) -> Tensor | None:
+        """Return the base optimizer's first-moment buffer for *p*, or *None*."""
+        if self.moment_key is None:
+            return None  # caller explicitly disabled; always use fallback
+        state = self.optimizer.state.get(p)
+        if not state:
+            return None
+        if self.moment_key != "auto":
+            return state.get(self.moment_key)
+        for key in _MOMENT_KEYS:
+            if key in state:
+                return state[key]
+        return None
+
+    # ------------------------------------------------------------------
     def step(self, closure=None):
         """Perform a single Magma-wrapped optimisation step."""
 
-        # --- Phase 1: pre-step (momentum, alignment, snapshot) --------
-        snapshots: dict[int, Tensor] = {}  # id(p) -> p.data clone
-        alignment_scores: dict[int, float] = {}
+        # Gradients are cloned because some optimizers modify them in-place
+        # (e.g. weight-decay injection).  Snapshots are needed for blending.
+        saved: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
 
         for group in self.optimizer.param_groups:
             for p in group["params"]:
                 if p.grad is None or id(p) in self._exclude_ids:
                     continue
+                saved[id(p)] = (p, p.grad.detach().clone(), p.data.clone())
 
-                pid = id(p)
-                grad = p.grad.detach()
+        # The base optimizer updates its internal momentum / second-moment
+        # states for ALL parameters, regardless of Magma masking.
+        # matches the paper: "momentum states are updated densely even when
+        # parameter updates are masked".
+        loss = self.optimizer.step(closure)
 
-                # Lazily initialise per-param Magma state
-                if pid not in self._state:
-                    self._state[pid] = {
-                        "momentum": torch.zeros_like(p.data),
-                        "alignment": torch.tensor(1.0, device=p.device),
-                    }
+        # alignment & masked blending
+        for pid, (p, grad, snapshot) in saved.items():
+            if pid not in self._state:
+                self._state[pid] = {
+                    "alignment": torch.tensor(1.0, device=p.device),
+                }
+            st = self._state[pid]
 
-                st = self._state[pid]
-
-                #  μ_t = β μ_{t-1} + (1-β) g_t
+            # obtain the first-moment estimate μ_t.  Prefer the base
+            # optimizer's own buffer (already updated with g_t during step).
+            moment = self._get_first_moment(p)
+            if moment is None:
+                # Fallback: maintain our own EMA momentum buffer.
+                if "momentum" not in st:
+                    st["momentum"] = torch.zeros_like(p.data)
                 st["momentum"].mul_(self.momentum_beta).add_(
                     grad, alpha=1.0 - self.momentum_beta
                 )
+                moment = st["momentum"]
 
-                #  cossim(μ_t, g_t)
-                cos = torch.nn.functional.cosine_similarity(
-                    st["momentum"].flatten().unsqueeze(0),
-                    grad.flatten().unsqueeze(0),
-                ).item()
-                
-                # sigmoid(cos/τ) 
-                s_tilde = torch.sigmoid(
-                    torch.tensor(cos / self.tau, device=p.device)
-                ).item()
+            # cossim(μ_t, g_t)
+            cos = torch.nn.functional.cosine_similarity(
+                moment.flatten().unsqueeze(0),
+                grad.flatten().unsqueeze(0),
+            ).item()
 
-                # EMA smoothing
-                s_prev = st["alignment"].item()
-                s = self.alignment_ema * s_prev + (1.0 - self.alignment_ema) * s_tilde
-                st["alignment"].fill_(s)
+            # sigmoid(cos / τ)
+            s_tilde = torch.sigmoid(
+                torch.tensor(cos / self.tau, device=p.device)
+            ).item()
 
-                alignment_scores[pid] = s
+            # EMA smoothing
+            s_prev = st["alignment"].item()
+            s = self.alignment_ema * s_prev + (1.0 - self.alignment_ema) * s_tilde
+            st["alignment"].fill_(s)
 
-                # Save current params
-                snapshots[pid] = p.data.clone()
+            # m_t ~ Bernoulli(mask_prob)
+            mask = float(torch.bernoulli(torch.tensor(self.mask_prob)).item())
+            # blend = s_t * m_t
+            blend = s * mask
 
-        loss = self.optimizer.step(closure)
-
-        for group in self.optimizer.param_groups:
-            for p in group["params"]:
-                pid = id(p)
-                if pid not in snapshots:
-                    continue
-
-                # m_t ~ Bernoulli(mask_prob)
-                mask = float(torch.bernoulli(torch.tensor(self.mask_prob)).item())
-                s = alignment_scores[pid]
-                # blend = s_t * m_t
-                blend = s * mask
-
-                if blend == 0.0:
-                    # Fully revert parameter to pre-step value
-                    p.data.copy_(snapshots[pid])
-                elif blend != 1.0:
-                    # θ = blend*θ_new + (1-blend)*θ_old
-                    p.data.mul_(blend).add_(snapshots[pid], alpha=1.0 - blend)
-                # blend == 1.0, keep as it is
+            if blend == 0.0:
+                # Fully revert parameter to pre-step value
+                p.data.copy_(snapshot)
+            elif blend != 1.0:
+                # θ = blend*θ_new + (1-blend)*θ_old
+                p.data.mul_(blend).add_(snapshot, alpha=1.0 - blend)
+            # blend == 1.0 → keep as-is
 
         return loss
 
-    
     def zero_grad(self, set_to_none: bool = True):
         self.optimizer.zero_grad(set_to_none=set_to_none)
 
@@ -179,6 +202,7 @@ class Magma:
             f"  tau={self.tau},\n"
             f"  momentum_beta={self.momentum_beta},\n"
             f"  alignment_ema={self.alignment_ema},\n"
+            f"  moment_key={self.moment_key!r},\n"
             f"  base={self.optimizer}\n"
             f")"
         )
