@@ -2,7 +2,7 @@
 
 **Momentum-Aligned Gradient Masking for Adaptive Optimizers**
 
-Magma is a lightweight wrapper that applies block-wise stochastic masking to any PyTorch optimizer, modulated by the alignment between gradient momentum and the current gradient. It is an implementation of the algorithm described in *"On Surprising Effectiveness of Masking Updates in Adaptive Optimizers"*[(arXiv 2602.15322)](https://arxiv.org/pdf/2602.15322).
+Magma is a lightweight wrapper that applies block-wise stochastic masking to any PyTorch optimizer, modulated by the alignment between gradient momentum and the current gradient. It is an implementation of the algorithm described in *"On Surprising Effectiveness of Masking Updates in Adaptive Optimizers"*[(arXiv 2602.15322)](https://arxiv.org/abs/2602.15322).
 
 The core insight is deceptively simple. At each step, a per-parameter Bernoulli coin flip decides whether to keep or discard the update. Updates that survive are further scaled by a smoothed cosine similarity score between the gradient and its exponential moving average. The base optimizer's internal states i.e Adam's running means or RMSProp's squared gradients are always updated. Only the parameter itself is masked.
 
